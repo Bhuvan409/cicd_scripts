@@ -1,0 +1,327 @@
+pipeline {
+    agent { label 'eptf-tii-097-am62x-sip' }
+    
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+    
+    environment {
+        TARGET_REPO_URL = 'https://github.com/Bhuvan409/Meta-tisdk.git'
+        SCRIPT_REPO_URL = 'https://github.com/Bhuvan409/cicd_scripts.git'
+        GITHUB_REPO = 'Bhuvan409/Meta-tisdk'
+        GITHUB_API = 'https://api.github.com'
+        GIT_CREDENTIALS = 'github-pooling'
+        SCRIPT_DIR = "${WORKSPACE}/pr-checker"
+        CACHE_FILE = "${WORKSPACE}/.pr_cache.json"
+        HTTP_PROXY = 'http://webproxy.ext.ti.com:80'
+        HTTPS_PROXY = 'http://webproxy.ext.ti.com:80'
+    }
+    
+    options {
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '50'))
+    }
+    
+    stages {
+        stage('Setup') {
+            steps {
+                echo "========================================="
+                echo "PR Checker - Polling for PRs"
+                echo "Repository: ${GITHUB_REPO}"
+                echo "Time: ${new Date()}"
+                echo "========================================="
+                
+                dir("${SCRIPT_DIR}") {
+                    git url: "${SCRIPT_REPO_URL}", 
+                        branch: 'main', 
+                        credentialsId: "${GIT_CREDENTIALS}"
+                    sh "chmod +x scripts/*.sh scripts/checks/*.sh scripts/checks/*.py"
+                }
+            }
+        }
+        
+        stage('Find PRs') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(
+                        credentialsId: "${GIT_CREDENTIALS}",
+                        usernameVariable: 'GITHUB_USER',
+                        passwordVariable: 'GITHUB_TOKEN'
+                    )]) {
+                        def response = sh(
+                            script: """
+                                set +x
+                                curl -s -w "\\nHTTP_CODE:%{http_code}" \
+                                     --proxy ${HTTP_PROXY} \
+                                     -H "Authorization: token \${GITHUB_TOKEN}" \
+                                     -H "Accept: application/vnd.github.v3+json" \
+                                     "${GITHUB_API}/repos/${GITHUB_REPO}/pulls?state=open&per_page=100"
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        
+                        def lines = response.split('\n')
+                        def httpCodeLine = lines.find { it.startsWith('HTTP_CODE:') }
+                        
+                        if (!httpCodeLine) {
+                            error("Failed to get HTTP status code from GitHub API")
+                        }
+                        
+                        def httpCode = httpCodeLine.replace('HTTP_CODE:', '').trim()
+                        def jsonResponse = lines.findAll { !it.startsWith('HTTP_CODE:') }.join('\n')
+                        
+                        if (httpCode != '200') {
+                            error("GitHub API returned HTTP ${httpCode}")
+                        }
+                        
+                        def prs = readJSON text: jsonResponse
+                        
+                        if (prs.size() == 0) {
+                            echo "No open PRs found"
+                            currentBuild.result = 'SUCCESS'
+                            currentBuild.description = "No PRs"
+                            env.SKIP_TESTING = 'true'
+                            return
+                        }
+                        
+                        echo "Found ${prs.size()} open PR(s)"
+                        
+                        def cache = [:]
+                        if (fileExists("${CACHE_FILE}")) {
+                            try {
+                                cache = readJSON file: "${CACHE_FILE}"
+                            } catch (Exception e) {
+                                cache = [:]
+                            }
+                        }
+                        
+                        def prsToTest = []
+                        prs.each { pr ->
+                            def cacheKey = "${pr.number}-${pr.head.sha}"
+                            if (!cache.containsKey(cacheKey)) {
+                                prsToTest.add([
+                                    number: pr.number,
+                                    commit: pr.head.sha,
+                                    title: pr.title,
+                                    author: pr.user.login,
+                                    branch: pr.head.ref,
+                                    target: pr.base.ref
+                                ])
+                                echo "PR #${pr.number}: ${pr.title} - NEEDS TESTING"
+                            } else {
+                                echo "PR #${pr.number}: ${pr.title} - ALREADY TESTED"
+                            }
+                        }
+                        
+                        if (prsToTest.size() == 0) {
+                            echo "All PRs already tested"
+                            currentBuild.result = 'SUCCESS'
+                            currentBuild.description = "All PRs up to date"
+                            env.SKIP_TESTING = 'true'
+                            return
+                        }
+                        
+                        env.PRS_TO_TEST = writeJSON(returnText: true, json: prsToTest)
+                        currentBuild.description = "Testing ${prsToTest.size()} PR(s)"
+                    }
+                }
+            }
+        }
+        
+        stage('Test PRs') {
+            when {
+                expression { 
+                    return env.SKIP_TESTING != 'true' && env.PRS_TO_TEST != null 
+                }
+            }
+            steps {
+                script {
+                    def prsToTest = readJSON text: env.PRS_TO_TEST
+                    def cache = fileExists("${CACHE_FILE}") ? readJSON(file: "${CACHE_FILE}") : [:]
+                    
+                    prsToTest.each { pr ->
+                        echo "Testing PR #${pr.number}: ${pr.title}"
+                        
+                        def result = testPR(pr.number.toString(), pr.commit, pr.target)
+                        
+                        cache["${pr.number}-${pr.commit}"] = [
+                            timestamp: new Date().format('yyyy-MM-dd HH:mm:ss'),
+                            result: result,
+                            title: pr.title,
+                            author: pr.author
+                        ]
+                        
+                        writeJSON file: "${CACHE_FILE}", json: cache, pretty: 4
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "Polling cycle completed"
+        }
+    }
+}
+
+def testPR(prNumber, prCommit, prTarget) {
+    def targetDir = "${WORKSPACE}/pr-${prNumber}"
+    def resultsDir = "${WORKSPACE}/results-${prNumber}"
+    
+    try {
+        sh """
+            rm -rf ${targetDir} ${resultsDir}
+            mkdir -p ${targetDir} ${resultsDir}
+        """
+        
+        dir(targetDir) {
+            checkout([
+                $class: 'GitSCM',
+                branches: [[name: "${prCommit}"]],
+                extensions: [
+                    [$class: 'CleanCheckout'],
+                    [$class: 'CloneOption', depth: 1, shallow: true, noTags: true]
+                ],
+                userRemoteConfigs: [[
+                    url: "${TARGET_REPO_URL}",
+                    refspec: "+refs/pull/${prNumber}/head:refs/remotes/origin/pr/${prNumber}",
+                    credentialsId: "${GIT_CREDENTIALS}"
+                ]]
+            ])
+            
+            sh "git fetch origin ${prTarget}:${prTarget}"
+        }
+        
+        // Post start comment
+        postPRComment(prNumber, prCommit, "started", resultsDir)
+        
+        // Run checks
+        def checkStatus = 0
+        dir(targetDir) {
+            checkStatus = sh(
+                script: """
+                    export RESULTS_DIR=${resultsDir}
+                    ${SCRIPT_DIR}/scripts/pr_checker.sh \
+                        --pr ${prNumber} \
+                        --target ${prTarget}
+                """,
+                returnStatus: true
+            )
+        }
+        
+        // Show results in console
+        sh """
+            echo "========================================="
+            echo "Results for PR #${prNumber}"
+            echo "========================================="
+            if [ -d "${resultsDir}" ]; then
+                for f in ${resultsDir}/*.txt; do
+                    [ -f "\$f" ] && cat "\$f" && echo ""
+                done
+            fi
+        """
+        
+        // Post final comment
+        def state = checkStatus == 0 ? 'success' : 'failure'
+        postPRComment(prNumber, prCommit, state, resultsDir)
+        
+        archiveArtifacts artifacts: "results-${prNumber}/**/*", allowEmptyArchive: true
+        sh "rm -rf ${targetDir}"
+        
+        return checkStatus == 0 ? 'PASSED' : 'FAILED'
+        
+    } catch (Exception e) {
+        echo "ERROR: ${e.message}"
+        postPRComment(prNumber, prCommit, "error", resultsDir, e.message)
+        return 'ERROR'
+    }
+}
+
+def postPRComment(prNumber, prCommit, state, resultsDir, errorMessage = null) {
+    try {
+        def commentText = buildSimpleComment(prNumber, prCommit, state, resultsDir, errorMessage)
+        
+        withCredentials([usernamePassword(
+            credentialsId: "${GIT_CREDENTIALS}",
+            usernameVariable: 'GITHUB_USER',
+            passwordVariable: 'GITHUB_TOKEN'
+        )]) {
+            
+            def commentFile = "${WORKSPACE}/comment-${prNumber}.txt"
+            writeFile file: commentFile, text: commentText
+            
+            sh """
+                set +x
+                export GITHUB_TOKEN=\${GITHUB_TOKEN}
+                export HTTP_PROXY=${HTTP_PROXY}
+                export HTTPS_PROXY=${HTTPS_PROXY}
+                export GITHUB_API=${GITHUB_API}
+                export GITHUB_REPO=${GITHUB_REPO}
+                
+                ${SCRIPT_DIR}/scripts/github_comment.sh \
+                    --pr ${prNumber} \
+                    --file ${commentFile}
+            """
+            
+            echo "Posted comment to PR #${prNumber}"
+        }
+    } catch (Exception e) {
+        echo "WARNING: Failed to post comment: ${e.message}"
+    }
+}
+
+def buildSimpleComment(prNumber, prCommit, state, resultsDir, errorMessage) {
+    def timestamp = new Date().format('yyyy-MM-dd HH:mm:ss')
+    def buildUrl = "${BUILD_URL}console"
+    
+    def comment = ""
+    
+    if (state == 'started') {
+        comment = "PR Checker Started\n\n"
+        comment += "PR: #${prNumber}\n"
+        comment += "Commit: ${prCommit.take(7)}\n"
+        comment += "Running checks...\n"
+        return comment
+    }
+    
+    if (state == 'success') {
+        comment = "PR Checker - PASSED\n\n"
+    } else if (state == 'failure') {
+        comment = "PR Checker - FAILED\n\n"
+    } else {
+        comment = "PR Checker - ERROR\n\n"
+    }
+    
+    comment += "PR: #${prNumber}\n"
+    comment += "Commit: ${prCommit.take(7)}\n"
+    comment += "Status: ${state.toUpperCase()}\n\n"
+    
+    if (errorMessage) {
+        comment += "Error: ${errorMessage}\n\n"
+    }
+    
+    if (resultsDir && fileExists(resultsDir)) {
+        comment += "Results:\n\n"
+        
+        def resultFiles = sh(
+            script: "ls ${resultsDir}/*.txt 2>/dev/null || true",
+            returnStdout: true
+        ).trim()
+        
+        if (resultFiles) {
+            resultFiles.split('\n').each { filePath ->
+                if (filePath) {
+                    def fileName = sh(script: "basename ${filePath}", returnStdout: true).trim()
+                    def content = sh(script: "cat ${filePath}", returnStdout: true).trim()
+                    
+                    comment += "${content}\n\n"
+                }
+            }
+        }
+    }
+    
+    return comment
+}
